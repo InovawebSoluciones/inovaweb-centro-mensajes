@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddyfile — inovaweb-centro-mensajes  (REFERENCIA)
+#
+# En produccion el reverse proxy lo termina la Caddy del stack n8n que ya
+# corre en el VPS Contabo. Este archivo es la fuente de verdad del bloque
+# que se debe pegar en /opt/n8n/Caddyfile (NO se usa directamente aqui
+# salvo con --profile edge).
+# ─────────────────────────────────────────────────────────────────────────────
+
+{
+    # Email para Let's Encrypt (notificaciones de expiracion de cert).
+    email conrado.torres@inovaweb.com.mx
+
+    servers {
+        protocols h1 h2 h3
+    }
+}
+
+mensajes.inovaweb.com.mx {
+
+    # ── Security headers (defensa en profundidad) ────────────────────────────
+    header {
+        # HTTPS estricto por 2 anos
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+
+        # Anti-clickjacking
+        X-Frame-Options "DENY"
+
+        # MIME-sniffing off
+        X-Content-Type-Options "nosniff"
+
+        # Referrer minimo
+        Referrer-Policy "strict-origin-when-cross-origin"
+
+        # CSP estricta — el centro es API JSON, no sirve HTML interactivo
+        # (excepto el pixel de tracking que sirve binario image/gif).
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+
+        # Bloquear FLoC / permisos no necesarios
+        Permissions-Policy "interest-cohort=(), geolocation=(), microphone=(), camera=()"
+
+        # Quitar header que delata el servidor
+        -Server
+    }
+
+    # ── Limites de body ──────────────────────────────────────────────────────
+    # 512 KiB acomoda body HTML de correos (max 200KB segun SECURITY.md)
+    # mas headers y multipart razonable.
+    request_body {
+        max_size 512KB
+    }
+
+    # ── Logging de acceso (JSON estructurado) ────────────────────────────────
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+
+    # ── Routing ─────────────────────────────────────────────────────────────
+    # Todo va al centro. FastAPI separa /health, /v1/*, /admin/v1/*,
+    # /webhooks/*, /v1/track/* y /docs.
+    #
+    # Cuando se pega este bloque en el Caddyfile del stack n8n, el upstream
+    # se alcanza por nombre de contenedor en la red docker n8n_default:
+    reverse_proxy centro_mensajes:8001 {
+        # Propagar IP real del cliente y request id si viene.
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Timeouts conservadores; proveedores externos (Resend, Meta, Twilio)
+        # pueden tardar varios segundos.
+        transport http {
+            dial_timeout 10s
+            response_header_timeout 30s
+        }
+    }
+}

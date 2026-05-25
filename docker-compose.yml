@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — inovaweb-centro-mensajes
+#
+# Stack auto-contenido (postgres + centro_mensajes). El reverse proxy/TLS lo
+# termina la Caddy externa del stack n8n que ya corre en el VPS Contabo.
+#
+# Mapa de puertos del VPS (host):
+#   8000 = microfichas-backend (Swigg)
+#   8001 = microfichas-ffmpeg
+#   8002 = scraping-backend
+#   8003 = inovaweb-hub-pasarelas
+#   8004 = inovaweb-finanzas-core
+#   8005 = inovaweb-centro-mensajes (este servicio)  <-- libre
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: messages_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-messages}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requerido en .env}
+      POSTGRES_DB: ${POSTGRES_DB:-centro_mensajes}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - messages_pg_data:/var/lib/postgresql/data
+      # Migraciones que se aplican AUTOMATICAMENTE solo en el primer arranque
+      # (postgres ejecuta scripts en /docker-entrypoint-initdb.d/ una sola vez).
+      - ./database:/docker-entrypoint-initdb.d:ro
+    # Sin mapping a host: postgres solo es accesible desde la red 'internal'.
+    # Para psql manual: docker compose exec postgres psql -U messages centro_mensajes
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-messages} -d ${POSTGRES_DB:-centro_mensajes}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - internal
+
+  centro_mensajes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: centro_mensajes
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Sobreescribe DATABASE_URL para apuntar al postgres del compose.
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-messages}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-centro_mensajes}"
+    # Publicado en loopback del host en 8005 (los 8000-8004 estan ocupados).
+    # El contenedor internamente escucha en 8001. La Caddy externa del stack
+    # n8n hace proxy al nombre de contenedor centro_mensajes:8001 via la red
+    # n8n_default, sin pasar por el puerto del host.
+    ports:
+      - "127.0.0.1:8005:8001"
+    expose:
+      - "8001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - internal
+      - edge
+      # Red externa del stack n8n: permite que el Caddy de n8n alcance al
+      # centro de mensajes por nombre de contenedor (centro_mensajes:8001)
+      # sin exponer puertos al host. Mismo patron que hub-pasarelas y
+      # finanzas-core.
+      - n8n_default
+
+  # ── Caddy opcional ──────────────────────────────────────────────────────────
+  # Solo se levanta con --profile edge. Util en despliegues nuevos sin Caddy
+  # preexistente. En el VPS actual la Caddy de n8n maneja 80/443.
+  caddy:
+    image: caddy:2-alpine
+    container_name: messages_caddy
+    restart: unless-stopped
+    profiles:
+      - edge
+    depends_on:
+      - centro_mensajes
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - messages_caddy_data:/data
+      - messages_caddy_config:/config
+    networks:
+      - edge
+
+volumes:
+  messages_pg_data:
+  messages_caddy_data:
+  messages_caddy_config:
+
+networks:
+  internal:
+    driver: bridge
+  edge:
+    driver: bridge
+  # Red preexistente del stack n8n (donde vive el Caddy que termina TLS).
+  # Declarada como external para que docker compose no intente crearla.
+  n8n_default:
+    external: true
