@@ -107,8 +107,11 @@ BEGIN
     IF NEW.message_text         IS DISTINCT FROM OLD.message_text         THEN
         RAISE EXCEPTION 'messages.message_text es inmutable';
     END IF;
-    IF NEW.amount_cents_charged IS DISTINCT FROM OLD.amount_cents_charged THEN
-        RAISE EXCEPTION 'messages.amount_cents_charged es inmutable';
+    -- amount_cents_charged: solo permitir transicion NULL -> valor (snapshot del
+    -- catalogo de precios al momento del despacho). Una vez seteado, inmutable.
+    IF OLD.amount_cents_charged IS NOT NULL
+       AND NEW.amount_cents_charged IS DISTINCT FROM OLD.amount_cents_charged THEN
+        RAISE EXCEPTION 'messages.amount_cents_charged solo puede setearse una vez';
     END IF;
     IF NEW.currency             IS DISTINCT FROM OLD.currency             THEN
         RAISE EXCEPTION 'messages.currency es inmutable';

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -39,14 +40,16 @@ class CredentialsIn(BaseModel):
 @router.post("/tenants/{tenant_id}/channels/{channel}/credentials",
              status_code=status.HTTP_201_CREATED)
 async def register_credentials(
-    tenant_id: str,
+    tenant_id: UUID,
     channel: Literal["email", "whatsapp", "sms"],
     body: CredentialsIn,
     ctx: AuthContext = Depends(require_scope("admin:credentials")),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    # Multi-tenant guard: solo permitir registrar credenciales del propio tenant.
-    if tenant_id != ctx.tenant_id and "*" not in ctx.scopes:
+    # Multi-tenant guard: comparacion como UUID (audit fix — antes era string
+    # compare frágil ante diferencias de casing).
+    tenant_id_str = str(tenant_id)
+    if tenant_id_str != str(UUID(ctx.tenant_id)) and "*" not in ctx.scopes:
         raise HTTPException(403, "no autorizado para gestionar credenciales de otro tenant")
 
     if body.provider_slug not in supported_slugs():
@@ -70,7 +73,7 @@ async def register_credentials(
              WHERE tenant_id = CAST(:tid AS uuid)
                AND channel = :ch
                AND is_default = true
-        """), {"tid": tenant_id, "ch": channel})
+        """), {"tid": tenant_id_str, "ch": channel})
 
     # UPSERT: si ya existe (tenant, channel, provider), actualizamos encrypted_value.
     row = (await db.execute(text("""
@@ -86,7 +89,7 @@ async def register_credentials(
                       updated_at      = NOW()
         RETURNING id::text AS id, channel, provider_slug, is_default, is_active, updated_at
     """), {
-        "tid": tenant_id, "ch": channel, "prov": body.provider_slug,
+        "tid": tenant_id_str, "ch": channel, "prov": body.provider_slug,
         "enc": encrypted, "def": body.is_default,
     })).mappings().first()
     await db.commit()
@@ -95,12 +98,13 @@ async def register_credentials(
 
 @router.get("/tenants/{tenant_id}/channels/{channel}/credentials")
 async def list_credentials(
-    tenant_id: str,
+    tenant_id: UUID,
     channel: Literal["email", "whatsapp", "sms"],
     ctx: AuthContext = Depends(require_scope("admin:credentials")),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    if tenant_id != ctx.tenant_id and "*" not in ctx.scopes:
+    tenant_id_str = str(tenant_id)
+    if tenant_id_str != str(UUID(ctx.tenant_id)) and "*" not in ctx.scopes:
         raise HTTPException(403, "no autorizado para leer credenciales de otro tenant")
 
     rows = (await db.execute(text("""
@@ -108,5 +112,5 @@ async def list_credentials(
         FROM tenant_channel_credentials
         WHERE tenant_id = CAST(:tid AS uuid) AND channel = :ch
         ORDER BY created_at DESC
-    """), {"tid": tenant_id, "ch": channel})).mappings().all()
+    """), {"tid": tenant_id_str, "ch": channel})).mappings().all()
     return {"items": [dict(r) for r in rows], "count": len(rows)}

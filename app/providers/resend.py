@@ -36,6 +36,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import time
 from typing import Any, Optional
 
 import httpx
@@ -55,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 
 RESEND_API_BASE = "https://api.resend.com"
+
+# Ventana de tolerancia para timestamps de webhook svix (anti-replay).
+# 5 minutos cubre clock skew razonable sin permitir replay de eventos viejos.
+SVIX_TOLERANCE_SECONDS = 5 * 60
 
 
 # Mapeo de event_type de Resend al lifecycle interno del centro.
@@ -189,6 +194,18 @@ class ResendProvider(MessageProvider):
         if not svix_id or not svix_timestamp or not svix_signature:
             raise ProviderSignatureError("Resend: faltan headers svix-*")
 
+        # Anti-replay: rechazar timestamps fuera de ventana de tolerancia
+        # (audit fix — antes se aceptaban eventos arbitrariamente viejos).
+        try:
+            ts = int(svix_timestamp)
+        except (TypeError, ValueError):
+            raise ProviderSignatureError("Resend: svix-timestamp invalido")
+        now = int(time.time())
+        if abs(now - ts) > SVIX_TOLERANCE_SECONDS:
+            raise ProviderSignatureError(
+                f"Resend: timestamp fuera de ventana de {SVIX_TOLERANCE_SECONDS}s"
+            )
+
         # El secret de svix viene con prefijo "whsec_" + base64.
         secret_b64 = self._webhook_secret
         if secret_b64.startswith("whsec_"):
@@ -198,7 +215,14 @@ class ResendProvider(MessageProvider):
         except Exception as exc:
             raise ProviderSignatureError(f"Resend: webhook_secret no es base64: {exc}") from exc
 
-        signed_payload = f"{svix_id}.{svix_timestamp}.{raw_body.decode('utf-8')}".encode("utf-8")
+        # decode utf-8 con errors='strict': si el body no es utf8 valido,
+        # rechazamos como firma invalida (no procesar payloads binarios).
+        try:
+            body_str = raw_body.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ProviderSignatureError("Resend: body no es UTF-8 valido")
+
+        signed_payload = f"{svix_id}.{svix_timestamp}.{body_str}".encode("utf-8")
         expected = base64.b64encode(
             hmac.new(secret_bytes, signed_payload, hashlib.sha256).digest()
         ).decode("ascii")

@@ -253,6 +253,10 @@ CREATE TABLE IF NOT EXISTS messages (
     events_count          INTEGER NOT NULL DEFAULT 0,
     last_error            TEXT,
 
+    -- ── Reintento del dispatch a proveedor externo ────────────────────────
+    dispatch_attempts     INTEGER NOT NULL DEFAULT 0,
+    last_dispatch_error   TEXT,
+
     -- Monto cobrado en el ledger por este mensaje (snapshot del catalogo).
     amount_cents_charged  BIGINT,
     currency              CHAR(3) NOT NULL DEFAULT 'MXN',
@@ -406,6 +410,27 @@ COMMENT ON TABLE  templates IS
 
 
 -- -----------------------------------------------------------------------------
+-- 8. TENANT_TRACKING_ALLOWLIST
+--    Allowlist opcional de dominios para click tracking por tenant.
+--    Si esta vacia para un tenant, NO se aplica restriccion (modo permisivo
+--    con firma HMAC obligatoria). Si tiene rows, el endpoint
+--    /v1/track/email/click rechaza redirects fuera de los dominios listados.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tenant_tracking_allowlist (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id    UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    domain       VARCHAR(253) NOT NULL,
+    is_active    BOOLEAN NOT NULL DEFAULT true,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, domain)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tracking_allowlist_tenant
+    ON tenant_tracking_allowlist (tenant_id)
+    WHERE is_active = true;
+
+
+-- -----------------------------------------------------------------------------
 -- VERIFICACION FINAL
 -- -----------------------------------------------------------------------------
 SELECT
@@ -421,6 +446,7 @@ WHERE t.table_schema = 'public'
     'templates',
     'tenant_channel_credentials',
     'messages',
-    'message_events'
+    'message_events',
+    'tenant_tracking_allowlist'
   )
 ORDER BY t.table_name;

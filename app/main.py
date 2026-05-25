@@ -72,6 +72,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await shutdown_ledger_client()
 
 
+# Audit fix: en prod ocultamos /docs, /redoc y /openapi.json para no revelar
+# el mapa completo del attack surface a actores no autenticados. En dev se
+# mantienen para desarrollo y testing.
+_is_prod = settings.env == "prod"
+
 app = FastAPI(
     title="Inovaweb Centro de Mensajes",
     description=(
@@ -85,22 +90,24 @@ app = FastAPI(
         "vs origin_kind=ai_generated."
     ),
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    docs_url=None if _is_prod else "/docs",
+    redoc_url=None if _is_prod else "/redoc",
+    openapi_url=None if _is_prod else "/openapi.json",
     lifespan=lifespan,
 )
 
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Permisivo: el centro es API-to-API y se filtra arriba (Caddy + API key).
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
-)
+# Audit fix: el centro es API-to-API (no browser). En prod sin CORS. En dev
+# se permite todo para facilitar pruebas locales.
+if not _is_prod:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+        allow_headers=["X-API-Key", "X-Request-Id", "Content-Type", "Accept"],
+    )
 app.add_middleware(RequestIdMiddleware)
 
 

@@ -21,11 +21,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 # Copiamos primero solo metadata + paquete para que cualquier cambio en
 # tests/ o docs/ no invalide la capa del pip install.
-COPY pyproject.toml CLAUDE.md ./
+COPY pyproject.toml CLAUDE.md requirements.lock ./
 COPY app/ ./app/
 RUN python -m pip install --upgrade pip setuptools wheel
-# Instalar el proyecto en un prefix portable que copiaremos al runtime.
-RUN python -m pip install --prefix=/install .
+# Instalar dependencias EXACTAS del lockfile + el paquete del proyecto.
+# El lockfile garantiza reproducibilidad: misma build, mismo binario.
+RUN python -m pip install --prefix=/install -r requirements.lock \
+    && python -m pip install --prefix=/install --no-deps .
 
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────

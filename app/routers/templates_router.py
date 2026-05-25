@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.api_key_auth import AuthContext, require_scope
 from app.core.database import get_db
+from app.core.template_render import TemplateError, validate_schema
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,12 @@ async def create_template(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Crea v1 de una plantilla nueva. Si el slug ya existe, devolver conflict."""
+    # Validar variables_schema al alta (audit fix: antes se aceptaba cualquier dict).
+    try:
+        normalized_schema = validate_schema(body.variables_schema)
+    except TemplateError as exc:
+        raise HTTPException(422, str(exc))
+
     existing = (await db.execute(text("""
         SELECT MAX(version) FROM templates
          WHERE tenant_id = CAST(:tid AS uuid) AND slug = :slug AND channel = :ch
@@ -71,7 +78,7 @@ async def create_template(
         "tid": ctx.tenant_id, "slug": body.slug, "ch": body.channel, "name": body.name,
         "subj": body.subject_template, "html": body.body_html_template,
         "txt": body.body_text_template, "msg": body.message_template,
-        "vs": json.dumps(body.variables_schema or {}),
+        "vs": json.dumps(normalized_schema),
         "md": json.dumps(body.metadata or {}),
         "akid": ctx.api_key_id,
     })).mappings().first()
@@ -139,16 +146,26 @@ async def patch_template(
     plantilla referenciada. El slug del body se ignora — se toma el existente.
     """
     cur = (await db.execute(text("""
-        SELECT slug, channel, version
+        SELECT slug, channel, version, is_active
         FROM templates
         WHERE id = CAST(:tid AS uuid) AND tenant_id = CAST(:ten AS uuid)
         LIMIT 1
     """), {"tid": str(template_id), "ten": ctx.tenant_id})).mappings().first()
     if not cur:
         raise HTTPException(404, "plantilla base no encontrada")
+    if not cur["is_active"]:
+        raise HTTPException(
+            422,
+            "plantilla base inactiva; usar otra version activa como referencia",
+        )
 
     if body.channel != cur["channel"]:
         raise HTTPException(422, "channel no puede cambiar entre versiones")
+
+    try:
+        normalized_schema = validate_schema(body.variables_schema)
+    except TemplateError as exc:
+        raise HTTPException(422, str(exc))
 
     new_version = int(cur["version"]) + 1
 
@@ -168,7 +185,7 @@ async def patch_template(
         "ch": cur["channel"], "name": body.name,
         "subj": body.subject_template, "html": body.body_html_template,
         "txt": body.body_text_template, "msg": body.message_template,
-        "vs": json.dumps(body.variables_schema or {}),
+        "vs": json.dumps(normalized_schema),
         "md": json.dumps(body.metadata or {}),
         "akid": ctx.api_key_id,
     })).mappings().first()

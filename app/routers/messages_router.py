@@ -22,6 +22,7 @@ Reglas firmes (contrato en docs/01-centro-mensajes-integracion-cores.md):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.api_key_auth import AuthContext, require_scope
+from app.core.config import settings
 from app.core.crypto import decrypt_value
 from app.core.database import get_db
 from app.core.ledger_client import (
@@ -44,6 +46,12 @@ from app.core.ledger_client import (
     get_ledger_client,
     source_ref_for,
 )
+from app.core.template_render import (
+    TemplateError,
+    render_template,
+    validate_variables,
+)
+from app.core.tracking_signing import sign_open
 from app.providers.base import (
     ProviderAuthError,
     ProviderError,
@@ -215,23 +223,22 @@ async def _load_template(
     return dict(row)
 
 
-def _render_template(tpl_str: Optional[str], variables: dict[str, Any]) -> Optional[str]:
-    """Renderizado minimo via str.format_map (substitucion de {var})."""
-    if tpl_str is None:
-        return None
+def _render_safe(tpl_str: Optional[str], variables: dict[str, Any]) -> Optional[str]:
+    """Wrapper que traduce TemplateError a HTTP 422."""
     try:
-        return tpl_str.format_map(_SafeDict(variables or {}))
-    except Exception as exc:
+        return render_template(tpl_str, variables)
+    except TemplateError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Error renderizando plantilla: {exc}",
         )
 
 
-class _SafeDict(dict):
-    """dict que devuelve '{key}' literal si la clave falta, en vez de KeyError."""
-    def __missing__(self, key):
-        return "{" + key + "}"
+def _detail_error(message: str) -> str:
+    """En prod, no exponer detalles de errores internos al cliente."""
+    if settings.env == "prod":
+        return "error procesando solicitud"
+    return message
 
 
 def _short_destination(channel: str, to_email: Optional[str], to_phone: Optional[str]) -> str:
@@ -296,6 +303,12 @@ async def _record_ledger_entry(
         new_status = "manual"
         last_error = f"error: {exc}"
         logger.error("ledger error for message %s: %s", message_id, exc)
+    except Exception as exc:  # noqa: BLE001 — red de seguridad
+        # Sin este catch, una excepcion no-tipada propagaba, el flujo se
+        # cortaba con 500 y el mensaje quedaba sent+pending sin retry.
+        new_status = "failed"
+        last_error = f"unexpected: {type(exc).__name__}: {exc}"
+        logger.exception("ledger unexpected error for message %s", message_id)
 
     await db.execute(text("""
         UPDATE messages
@@ -311,7 +324,7 @@ async def _record_ledger_entry(
         "rid": request_id,
         "eid": entry_id,
         "st": new_status,
-        "err": last_error,
+        "err": last_error[:1000] if last_error else None,
         "mid": message_id,
     })
     await db.commit()
@@ -346,17 +359,42 @@ async def send_email(
         tpl_slug = tpl["slug"]
         tpl_version = tpl["version"]
         variables = body.variables or {}
-        subject = _render_template(tpl["subject_template"], variables) or subject
-        body_html = _render_template(tpl["body_html_template"], variables) or body_html
-        body_text = _render_template(tpl["body_text_template"], variables) or body_text
+        # Validar variables contra el schema declarado al alta (audit fix).
+        try:
+            validate_variables(tpl.get("variables_schema") or {}, variables)
+        except TemplateError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(exc),
+            )
+        subject = _render_safe(tpl["subject_template"], variables) or subject
+        body_html = _render_safe(tpl["body_html_template"], variables) or body_html
+        body_text = _render_safe(tpl["body_text_template"], variables) or body_text
 
     if not subject:
         raise HTTPException(422, "subject vacio tras renderizar la plantilla")
     if not body_html and not body_text:
         raise HTTPException(422, "body_html o body_text requerido tras renderizar")
 
-    # INSERT en estado queued.
+    # Tracking pixel: si el caller lo solicito, insertar al final del body_html.
+    # El pixel apunta al endpoint publico firmado con HMAC para evitar enumeration.
+    if body.tracking and body.tracking.open and body_html:
+        pixel_sig = sign_open(message_id)
+        pixel_url = (
+            f"{settings.public_base_url.rstrip('/')}"
+            f"/v1/track/email/open/{message_id}?sig={pixel_sig}"
+        )
+        body_html = (
+            body_html
+            + f'\n<img src="{pixel_url}" width="1" height="1" '
+              'alt="" style="display:none;border:0" />'
+        )
+
+    # INSERT en estado queued. amount_cents_charged se setea desde el inicio
+    # (snapshot del catalogo) para evitar el problema del trigger inmutable
+    # con transicion NULL->valor que detecto la auditoria.
     queued_at = datetime.now(timezone.utc)
+    amount = DEFAULT_PRICES_CENTS["email"]
     await db.execute(text("""
         INSERT INTO messages (
             id, tenant_id, app_id, client_id, service_id,
@@ -367,6 +405,7 @@ async def send_email(
             subject, body_html, body_text,
             variables, tracking_open, tracking_click,
             meta, status, queued_at,
+            amount_cents_charged, currency,
             actor_api_key_id
         ) VALUES (
             CAST(:id AS uuid), CAST(:tid AS uuid), :app, :cli, :svc,
@@ -377,6 +416,7 @@ async def send_email(
             :subject, :body_html, :body_text,
             CAST(:vars AS jsonb), :track_open, :track_click,
             CAST(:meta AS jsonb), 'queued', :qat,
+            :amt, 'MXN',
             CAST(:akid AS uuid)
         )
     """), {
@@ -392,6 +432,7 @@ async def send_email(
         "track_click": bool(body.tracking and body.tracking.click),
         "meta": _json(body.meta or {}),
         "qat": queued_at,
+        "amt": amount,
         "akid": ctx.api_key_id,
     })
     await db.commit()
@@ -440,9 +481,26 @@ async def _dispatch_email(
     meta_caller: dict[str, Any],
     queued_at: datetime,
 ) -> None:
-    """Resuelve provider, envia, actualiza status y reporta al ledger."""
-    provider_slug, creds = await _resolve_credentials(db, tenant_id, "email")
+    """Resuelve provider, envia, actualiza status y reporta al ledger.
+    Garantiza que TODA salida actualiza messages (sent o failed) — nunca queda
+    queued huerfano. Captura Exception generica al final como red de seguridad.
+    """
+    try:
+        provider_slug, creds = await _resolve_credentials(db, tenant_id, "email")
+    except HTTPException as exc:
+        # Sin credencial -> failed con last_error claro.
+        await db.execute(text("""
+            UPDATE messages SET status='failed', failed_at=NOW(),
+                   last_error=:err,
+                   dispatch_attempts = dispatch_attempts + 1,
+                   last_dispatch_error = :err
+             WHERE id = CAST(:mid AS uuid)
+        """), {"err": f"no_credentials: {exc.detail}"[:1000], "mid": message_id})
+        await db.commit()
+        return
+
     provider = build_provider(provider_slug, creds)
+    result = None
     try:
         try:
             result = await provider.send_email(
@@ -457,17 +515,21 @@ async def _dispatch_email(
         except (ProviderValidationError, ProviderAuthError) as exc:
             await db.execute(text("""
                 UPDATE messages SET status='failed', failed_at=NOW(),
-                       last_error=:err, provider_slug=:ps
+                       last_error=:err, provider_slug=:ps,
+                       dispatch_attempts = dispatch_attempts + 1,
+                       last_dispatch_error = :err
                  WHERE id = CAST(:mid AS uuid)
-            """), {"err": str(exc)[:1000], "ps": provider_slug, "mid": message_id})
+            """), {"err": f"fatal: {exc}"[:1000], "ps": provider_slug, "mid": message_id})
             await db.commit()
             return
         except ProviderTransientError as exc:
-            # Mantener queued; el worker (futuro) reintentaria. Por ahora marcamos failed
-            # con last_error para diagnostico inmediato.
+            # Transitorio: marcar failed pero deja last_dispatch_error para que el
+            # operador (o un worker dispatch_retry futuro) lo reintente.
             await db.execute(text("""
                 UPDATE messages SET status='failed', failed_at=NOW(),
-                       last_error=:err, provider_slug=:ps
+                       last_error=:err, provider_slug=:ps,
+                       dispatch_attempts = dispatch_attempts + 1,
+                       last_dispatch_error = :err
                  WHERE id = CAST(:mid AS uuid)
             """), {"err": f"transient: {exc}"[:1000], "ps": provider_slug, "mid": message_id})
             await db.commit()
@@ -475,28 +537,46 @@ async def _dispatch_email(
         except ProviderError as exc:
             await db.execute(text("""
                 UPDATE messages SET status='failed', failed_at=NOW(),
-                       last_error=:err, provider_slug=:ps
+                       last_error=:err, provider_slug=:ps,
+                       dispatch_attempts = dispatch_attempts + 1,
+                       last_dispatch_error = :err
                  WHERE id = CAST(:mid AS uuid)
             """), {"err": str(exc)[:1000], "ps": provider_slug, "mid": message_id})
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001 — red de seguridad final
+            # Cualquier excepcion no-tipada del provider: registrarla y marcar failed.
+            # Sin este catch, el codigo dejaba el mensaje queued huerfano.
+            logger.exception(
+                "send_email: excepcion no tipada del provider %s msg %s",
+                provider_slug, message_id,
+            )
+            await db.execute(text("""
+                UPDATE messages SET status='failed', failed_at=NOW(),
+                       last_error=:err, provider_slug=:ps,
+                       dispatch_attempts = dispatch_attempts + 1,
+                       last_dispatch_error = :err
+                 WHERE id = CAST(:mid AS uuid)
+            """), {"err": f"unexpected: {type(exc).__name__}: {exc}"[:1000],
+                   "ps": provider_slug, "mid": message_id})
             await db.commit()
             return
     finally:
         await provider.aclose()
 
-    # Marcar sent + setear amount_cents_charged + external_message_id.
-    amount = DEFAULT_PRICES_CENTS["email"]
+    # Provider respondio OK. Marcar sent + setear external_message_id +
+    # ledger_status='pending' para que el worker tome cualquier huerfano.
     await db.execute(text("""
         UPDATE messages
            SET status='sent', sent_at=NOW(),
                provider_slug=:ps,
                external_message_id=:ext,
-               amount_cents_charged=:amt,
-               ledger_status='pending'
+               ledger_status='pending',
+               dispatch_attempts = dispatch_attempts + 1
          WHERE id = CAST(:mid AS uuid)
     """), {
         "ps": provider_slug,
         "ext": result.external_message_id,
-        "amt": amount,
         "mid": message_id,
     })
     await db.commit()
@@ -532,53 +612,24 @@ async def _dispatch_email(
 
 @router.post(
     "/v1/messages/whatsapp",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=MessageQueuedOut,
+    status_code=status.HTTP_501_NOT_IMPLEMENTED,
 )
 async def send_whatsapp(
     body: WhatsappIn,
     ctx: AuthContext = Depends(require_scope("messages:write")),
     db: AsyncSession = Depends(get_db),
-) -> MessageQueuedOut:
-    """Envio WhatsApp. En sprint 1, sin proveedor activo: solo encola en BD."""
-    tenant_id = ctx.tenant_id
-    message_id = str(uuid4())
-    queued_at = datetime.now(timezone.utc)
-
-    await db.execute(text("""
-        INSERT INTO messages (
-            id, tenant_id, app_id, client_id, service_id, channel,
-            template_slug, from_phone_id, to_phone, message_text,
-            variables, meta, status, queued_at, actor_api_key_id
-        ) VALUES (
-            CAST(:id AS uuid), CAST(:tid AS uuid),
-            :app, :cli, :svc, 'whatsapp',
-            :tpl, :from, :to, :msg,
-            CAST(:vars AS jsonb), CAST(:meta AS jsonb),
-            'queued', :qat, CAST(:akid AS uuid)
-        )
-    """), {
-        "id": message_id, "tid": tenant_id,
-        "app": body.app_id, "cli": body.client_id, "svc": body.service_id,
-        "tpl": body.template_id,
-        "from": body.from_phone_id, "to": body.to_phone, "msg": body.message_text,
-        "vars": _json(body.variables),
-        "meta": _json(body.meta or {}),
-        "qat": queued_at,
-        "akid": ctx.api_key_id,
-    })
-    await db.commit()
-    # Proveedor stub: dejamos queued con last_error informativo.
-    await db.execute(text("""
-        UPDATE messages SET status='failed', failed_at=NOW(),
-               last_error='whatsapp provider not implemented yet (sprint 2)'
-         WHERE id = CAST(:mid AS uuid)
-    """), {"mid": message_id})
-    await db.commit()
-
-    return MessageQueuedOut(
-        message_id=message_id, tenant_id=tenant_id,
-        channel="whatsapp", status="queued", queued_at=queued_at,
+) -> dict[str, str]:
+    """
+    WhatsApp pendiente para sprint 2 (Meta Cloud API).
+    Devuelve 501 honesto en vez del 202 enganyoso que detecto la auditoria.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "WhatsApp dispatch no implementado en sprint 1. "
+            "Disponible en sprint 2 (provider meta_whatsapp). "
+            "Mientras tanto, validar payload localmente sin enviar."
+        ),
     )
 
 
@@ -586,49 +637,23 @@ async def send_whatsapp(
 
 @router.post(
     "/v1/messages/sms",
-    status_code=status.HTTP_202_ACCEPTED,
-    response_model=MessageQueuedOut,
+    status_code=status.HTTP_501_NOT_IMPLEMENTED,
 )
 async def send_sms(
     body: SmsIn,
     ctx: AuthContext = Depends(require_scope("messages:write")),
     db: AsyncSession = Depends(get_db),
-) -> MessageQueuedOut:
-    """Envio SMS. En sprint 1, sin proveedor activo: solo encola en BD."""
-    tenant_id = ctx.tenant_id
-    message_id = str(uuid4())
-    queued_at = datetime.now(timezone.utc)
-
-    await db.execute(text("""
-        INSERT INTO messages (
-            id, tenant_id, app_id, client_id, service_id, channel,
-            from_phone_id, to_phone, message_text,
-            meta, status, queued_at, actor_api_key_id
-        ) VALUES (
-            CAST(:id AS uuid), CAST(:tid AS uuid),
-            :app, :cli, :svc, 'sms',
-            :from, :to, :msg,
-            CAST(:meta AS jsonb), 'queued', :qat, CAST(:akid AS uuid)
-        )
-    """), {
-        "id": message_id, "tid": tenant_id,
-        "app": body.app_id, "cli": body.client_id, "svc": body.service_id,
-        "from": body.from_phone_id, "to": body.to_phone, "msg": body.message,
-        "meta": _json(body.meta or {}),
-        "qat": queued_at,
-        "akid": ctx.api_key_id,
-    })
-    await db.commit()
-    await db.execute(text("""
-        UPDATE messages SET status='failed', failed_at=NOW(),
-               last_error='sms provider not implemented yet (sprint 2)'
-         WHERE id = CAST(:mid AS uuid)
-    """), {"mid": message_id})
-    await db.commit()
-
-    return MessageQueuedOut(
-        message_id=message_id, tenant_id=tenant_id,
-        channel="sms", status="queued", queued_at=queued_at,
+) -> dict[str, str]:
+    """
+    SMS pendiente para sprint 2 (Twilio).
+    Devuelve 501 honesto en vez del 202 enganyoso que detecto la auditoria.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            "SMS dispatch no implementado en sprint 1. "
+            "Disponible en sprint 2 (provider twilio)."
+        ),
     )
 
 
@@ -772,5 +797,4 @@ async def reports_usage(
 
 def _json(value: Any) -> str:
     """Serializa a JSON string para CAST a jsonb."""
-    import json as _json_mod
-    return _json_mod.dumps(value or {}, ensure_ascii=False, default=str)
+    return json.dumps(value or {}, ensure_ascii=False, default=str)

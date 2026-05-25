@@ -49,6 +49,10 @@ async def run_retry_once() -> dict[str, int]:
     stats = {"picked": 0, "recorded": 0, "still_failed": 0, "manual": 0, "errors": 0}
 
     async with SessionLocal() as db:
+        # Audit fix: incluir tambien 'pending' (mensajes huerfanos por crash del
+        # proceso entre marcar pending y completar el POST al ledger). Solo
+        # tocar pending que tengan al menos 60s desde el ultimo intento, para
+        # no competir con el request handler activo.
         rows = (await db.execute(text(f"""
             SELECT id::text AS id, tenant_id::text AS tenant_id,
                    channel, amount_cents_charged, currency,
@@ -56,10 +60,15 @@ async def run_retry_once() -> dict[str, int]:
                    app_id, client_id, service_id,
                    template_slug, origin_kind, external_message_id, meta
             FROM messages
-            WHERE ledger_status = 'failed'
+            WHERE ledger_status IN ('pending', 'failed')
               AND ledger_attempts < {MAX_ATTEMPTS}
               AND amount_cents_charged IS NOT NULL
               AND amount_cents_charged > 0
+              AND status IN ('sent', 'delivered', 'bounced')
+              AND (
+                ledger_last_attempt_at IS NULL
+                OR ledger_last_attempt_at < NOW() - INTERVAL '60 seconds'
+              )
             ORDER BY ledger_last_attempt_at ASC NULLS FIRST
             LIMIT {BATCH_SIZE}
             FOR UPDATE SKIP LOCKED

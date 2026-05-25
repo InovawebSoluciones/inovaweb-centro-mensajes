@@ -37,6 +37,13 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
+    # Hardening kernel-level (audit fix). Postgres necesita escribir al PGDATA
+    # (via volume) y a /tmp para sort/spill, pero el FS raiz puede ser readonly.
+    security_opt:
+      - no-new-privileges:true
+    # Limit razonable para no derribar otros cores del VPS ante OOM.
+    mem_limit: 1g
+    cpus: 1.5
     networks:
       - internal
 
@@ -68,6 +75,19 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    # Hardening kernel-level (audit fix).
+    # read_only: true requiere tmpfs para /tmp porque uvicorn/Python usan /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
+      - /var/tmp:size=16M,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Limites de recursos: protege a otros cores del VPS ante DoS/runaway.
+    mem_limit: 512m
+    cpus: 1.0
     logging:
       driver: json-file
       options:

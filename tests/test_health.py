@@ -25,9 +25,8 @@ def test_openapi_json_publico():
     assert resp.status_code == 200
     spec = resp.json()
     assert spec["info"]["title"] == "Inovaweb Centro de Mensajes"
-    # Confirmar que los paths principales estan registrados.
     paths = set(spec["paths"].keys())
-    for expected in [
+    expected_paths = [
         "/health",
         "/health/db",
         "/v1/messages/email",
@@ -39,5 +38,7 @@ def test_openapi_json_publico():
         "/admin/v1/templates",
         "/webhooks/{provider_slug}",
         "/v1/track/email/open/{message_id}",
-    ]:
-        assert expected in paths, f"missing path in openapi: {expected}"
+        "/v1/track/email/click/{message_id}",
+    ]
+    for p in expected_paths:
+        assert p in paths, "missing path in openapi: " + p
