@@ -8,6 +8,18 @@ finanzas-core para cobranza consolidada.
 
 **Estado:** en construccion (sprint 1, scaffolding inicial).
 
+> **Nota de estado — 2026-06-06 (auditoria global Inovaweb):** documentacion
+> formal generada en `docs/`: `ADR.md`, `RUNBOOK.md`, `DEPLOY.md`, `OWASP.md`,
+> `GUIA-DESARROLLADOR.md` y `CHANGELOG.md` (raiz). Auditoria OWASP sin FAIL;
+> WARN abiertos: rate limiting requiere Redis en prod, `body_html` de
+> `ai_generated` sin sanitizar (corre en el lector de correo, no en el
+> servidor), y falta verificar la config real de Nginx en el VPS (Nginx
+> reemplazo a Caddy como reverse proxy). Recordatorio: las plantillas `caf-*`
+> (`caf-pago-confirmado`, `caf-activacion-correo`, `caf-activacion-otp`) aun NO
+> estan sembradas (se crean via `POST /admin/v1/templates`; sin ellas el envio
+> con `origin_kind=template` da 404). Worker pendiente: `dispatch_retry`.
+> **Pendientes y detalle:** `auditoria-global-2026-06-06/REPORTE-centro-mensajes.md`.
+
 ---
 
 ## 1. Arquitectura Inovaweb (3 niveles)
