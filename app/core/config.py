@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     )
     finanzas_api_key: str = Field("", alias="FINANZAS_API_KEY")
 
+    # Arquitectura Inovaweb (D2): el CAF (Nivel 2) es el UNICO que contabiliza
+    # en el Finanzas-Core. Cuando esta en False (default), el Centro de Mensajes
+    # NO auto-reporta asientos al ledger; sigue enviando y contando mensajes
+    # igual. Ponerlo en True solo si se quiere el comportamiento legacy de
+    # auto-reporte directo al finanzas-core.
+    report_to_finanzas: bool = Field(False, alias="REPORT_TO_FINANZAS")
+
     # URL publica del centro (usada para pixel/click tracking en correos).
     # En produccion: https://mensajes.inovaweb.com.mx
     public_base_url: str = Field(

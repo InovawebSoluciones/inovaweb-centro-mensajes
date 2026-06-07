@@ -564,48 +564,67 @@ async def _dispatch_email(
     finally:
         await provider.aclose()
 
-    # Provider respondio OK. Marcar sent + setear external_message_id +
-    # ledger_status='pending' para que el worker tome cualquier huerfano.
-    await db.execute(text("""
-        UPDATE messages
-           SET status='sent', sent_at=NOW(),
-               provider_slug=:ps,
-               external_message_id=:ext,
-               ledger_status='pending',
-               dispatch_attempts = dispatch_attempts + 1
-         WHERE id = CAST(:mid AS uuid)
-    """), {
-        "ps": provider_slug,
-        "ext": result.external_message_id,
-        "mid": message_id,
-    })
+    # Provider respondio OK. Marcar sent + setear external_message_id.
+    # Arquitectura D2: el ledger_status solo pasa a 'pending' (y dispara el
+    # auto-reporte al finanzas-core) cuando report_to_finanzas esta activo. Con
+    # el flag en False (default), el CAF contabiliza y el Centro deja
+    # ledger_status en su default de BD ('not_applicable'), que el worker
+    # ledger_retry ignora.
+    if settings.report_to_finanzas:
+        await db.execute(text("""
+            UPDATE messages
+               SET status='sent', sent_at=NOW(),
+                   provider_slug=:ps,
+                   external_message_id=:ext,
+                   ledger_status='pending',
+                   dispatch_attempts = dispatch_attempts + 1
+             WHERE id = CAST(:mid AS uuid)
+        """), {
+            "ps": provider_slug,
+            "ext": result.external_message_id,
+            "mid": message_id,
+        })
+    else:
+        await db.execute(text("""
+            UPDATE messages
+               SET status='sent', sent_at=NOW(),
+                   provider_slug=:ps,
+                   external_message_id=:ext,
+                   dispatch_attempts = dispatch_attempts + 1
+             WHERE id = CAST(:mid AS uuid)
+        """), {
+            "ps": provider_slug,
+            "ext": result.external_message_id,
+            "mid": message_id,
+        })
     await db.commit()
 
-    # POST al finanzas-core (intento inmediato; el worker retoma fallos).
-    description = (
-        f"Email enviado a {_short_destination('email', to_email, None)} "
-        f"via {tpl_slug or 'ai_generated'}"
-    )
-    meta = {
-        "app_id":     meta_caller.get("app_id"),
-        "client_id":  meta_caller.get("client_id"),
-        "service_id": meta_caller.get("service_id"),
-        "template_id": tpl_slug,
-        "origin_kind": origin_kind,
-        "external_message_id": result.external_message_id,
-        # Pasamos tambien los meta del caller (medidor_event_id, model, tokens).
-        **{k: v for k, v in meta_caller.items() if k not in ("app_id", "client_id", "service_id")},
-    }
-    await _record_ledger_entry(
-        db,
-        message_id=message_id,
-        channel="email",
-        amount_cents=amount,
-        currency="MXN",
-        description=description,
-        meta=meta,
-        occurred_at=queued_at,
-    )
+    if settings.report_to_finanzas:
+        # POST al finanzas-core (intento inmediato; el worker retoma fallos).
+        description = (
+            f"Email enviado a {_short_destination('email', to_email, None)} "
+            f"via {tpl_slug or 'ai_generated'}"
+        )
+        meta = {
+            "app_id":     meta_caller.get("app_id"),
+            "client_id":  meta_caller.get("client_id"),
+            "service_id": meta_caller.get("service_id"),
+            "template_id": tpl_slug,
+            "origin_kind": origin_kind,
+            "external_message_id": result.external_message_id,
+            # Pasamos tambien los meta del caller (medidor_event_id, model, tokens).
+            **{k: v for k, v in meta_caller.items() if k not in ("app_id", "client_id", "service_id")},
+        }
+        await _record_ledger_entry(
+            db,
+            message_id=message_id,
+            channel="email",
+            amount_cents=amount,
+            currency="MXN",
+            description=description,
+            meta=meta,
+            occurred_at=queued_at,
+        )
 
 
 # ── POST /v1/messages/whatsapp ───────────────────────────────────────────────
