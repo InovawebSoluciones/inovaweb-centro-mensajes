@@ -55,7 +55,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # Worker de reintento al finanzas-core. Cada uvicorn worker corre su propio
     # loop; el SELECT con SKIP LOCKED evita doble procesamiento.
-    app.state.ledger_retry_task = asyncio.create_task(retry_loop_forever())
+    # Arquitectura D2: solo se arranca cuando report_to_finanzas esta activo. Con
+    # el flag en False (default) el CAF contabiliza y el Centro no auto-reporta,
+    # por lo que no hay asientos pendientes que reintentar.
+    if settings.report_to_finanzas:
+        app.state.ledger_retry_task = asyncio.create_task(retry_loop_forever())
+    else:
+        app.state.ledger_retry_task = None
+        logger.info(
+            "report_to_finanzas=False: worker ledger_retry NO arrancado "
+            "(el CAF contabiliza en el finanzas-core)."
+        )
 
     try:
         yield

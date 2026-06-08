@@ -564,48 +564,67 @@ async def _dispatch_email(
     finally:
         await provider.aclose()
 
-    # Provider respondio OK. Marcar sent + setear external_message_id +
-    # ledger_status='pending' para que el worker tome cualquier huerfano.
-    await db.execute(text("""
-        UPDATE messages
-           SET status='sent', sent_at=NOW(),
-               provider_slug=:ps,
-               external_message_id=:ext,
-               ledger_status='pending',
-               dispatch_attempts = dispatch_attempts + 1
-         WHERE id = CAST(:mid AS uuid)
-    """), {
-        "ps": provider_slug,
-        "ext": result.external_message_id,
-        "mid": message_id,
-    })
+    # Provider respondio OK. Marcar sent + setear external_message_id.
+    # Arquitectura D2: el ledger_status solo pasa a 'pending' (y dispara el
+    # auto-reporte al finanzas-core) cuando report_to_finanzas esta activo. Con
+    # el flag en False (default), el CAF contabiliza y el Centro deja
+    # ledger_status en su default de BD ('not_applicable'), que el worker
+    # ledger_retry ignora.
+    if settings.report_to_finanzas:
+        await db.execute(text("""
+            UPDATE messages
+               SET status='sent', sent_at=NOW(),
+                   provider_slug=:ps,
+                   external_message_id=:ext,
+                   ledger_status='pending',
+                   dispatch_attempts = dispatch_attempts + 1
+             WHERE id = CAST(:mid AS uuid)
+        """), {
+            "ps": provider_slug,
+            "ext": result.external_message_id,
+            "mid": message_id,
+        })
+    else:
+        await db.execute(text("""
+            UPDATE messages
+               SET status='sent', sent_at=NOW(),
+                   provider_slug=:ps,
+                   external_message_id=:ext,
+                   dispatch_attempts = dispatch_attempts + 1
+             WHERE id = CAST(:mid AS uuid)
+        """), {
+            "ps": provider_slug,
+            "ext": result.external_message_id,
+            "mid": message_id,
+        })
     await db.commit()
 
-    # POST al finanzas-core (intento inmediato; el worker retoma fallos).
-    description = (
-        f"Email enviado a {_short_destination('email', to_email, None)} "
-        f"via {tpl_slug or 'ai_generated'}"
-    )
-    meta = {
-        "app_id":     meta_caller.get("app_id"),
-        "client_id":  meta_caller.get("client_id"),
-        "service_id": meta_caller.get("service_id"),
-        "template_id": tpl_slug,
-        "origin_kind": origin_kind,
-        "external_message_id": result.external_message_id,
-        # Pasamos tambien los meta del caller (medidor_event_id, model, tokens).
-        **{k: v for k, v in meta_caller.items() if k not in ("app_id", "client_id", "service_id")},
-    }
-    await _record_ledger_entry(
-        db,
-        message_id=message_id,
-        channel="email",
-        amount_cents=amount,
-        currency="MXN",
-        description=description,
-        meta=meta,
-        occurred_at=queued_at,
-    )
+    if settings.report_to_finanzas:
+        # POST al finanzas-core (intento inmediato; el worker retoma fallos).
+        description = (
+            f"Email enviado a {_short_destination('email', to_email, None)} "
+            f"via {tpl_slug or 'ai_generated'}"
+        )
+        meta = {
+            "app_id":     meta_caller.get("app_id"),
+            "client_id":  meta_caller.get("client_id"),
+            "service_id": meta_caller.get("service_id"),
+            "template_id": tpl_slug,
+            "origin_kind": origin_kind,
+            "external_message_id": result.external_message_id,
+            # Pasamos tambien los meta del caller (medidor_event_id, model, tokens).
+            **{k: v for k, v in meta_caller.items() if k not in ("app_id", "client_id", "service_id")},
+        }
+        await _record_ledger_entry(
+            db,
+            message_id=message_id,
+            channel="email",
+            amount_cents=amount,
+            currency="MXN",
+            description=description,
+            meta=meta,
+            occurred_at=queued_at,
+        )
 
 
 # ── POST /v1/messages/whatsapp ───────────────────────────────────────────────
@@ -798,3 +817,80 @@ async def reports_usage(
 def _json(value: Any) -> str:
     """Serializa a JSON string para CAST a jsonb."""
     return json.dumps(value or {}, ensure_ascii=False, default=str)
+
+
+# ── POST /v1/messages/record (conteo de envíos hechos FUERA de Centro) ────────
+
+class RecordIn(BaseModel):
+    """Registro de un mensaje ya enviado por otro emisor (SMTP de Scraping/n8n)."""
+
+    channel: Literal["email", "whatsapp", "sms"] = "email"
+    to_email: Optional[EmailStr] = None
+    to_phone: Optional[str] = None
+    to_name: Optional[str] = None
+    from_email: Optional[str] = None
+    subject: Optional[str] = None
+    client_id: Optional[str] = None
+    app_id: Optional[str] = None
+    provider_slug: Optional[str] = None
+    source_ref: Optional[str] = Field(default=None, max_length=200)
+    body_html: Optional[str] = None
+    subject2: Optional[str] = None
+    sent_at: Optional[datetime] = None
+
+
+@router.post("/v1/messages/record", status_code=status.HTTP_201_CREATED)
+async def record_message(
+    body: RecordIn,
+    ctx: AuthContext = Depends(require_scope("messages:write")),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Cuenta un mensaje YA ENVIADO fuera de Centro (no despacha nada).
+
+    Inserta una fila status='sent' para que entre en reports/usage y el CAF la
+    tarifique. Idempotente por (tenant, meta.source_ref).
+    """
+    tenant_id = ctx.tenant_id
+    if body.channel == "email" and not body.to_email:
+        raise HTTPException(422, "to_email requerido para channel=email")
+    if body.channel in ("whatsapp", "sms") and not body.to_phone:
+        raise HTTPException(422, "to_phone requerido para channel whatsapp/sms")
+
+    if body.source_ref:
+        ex = (await db.execute(text(
+            "SELECT id FROM messages WHERE tenant_id = CAST(:t AS uuid) "
+            "AND meta->>'source_ref' = :sr LIMIT 1"
+        ), {"t": tenant_id, "sr": body.source_ref})).first()
+        if ex:
+            return {"message_id": str(ex[0]), "idempotent_replay": True}
+
+    mid = str(uuid4())
+    sent_at = body.sent_at or datetime.now(timezone.utc)
+    origin_kind = "ai_generated" if body.channel == "email" else None
+    amount = DEFAULT_PRICES_CENTS.get(body.channel)
+    meta = {"recorded": True}
+    if body.source_ref:
+        meta["source_ref"] = body.source_ref
+
+    await db.execute(text("""
+        INSERT INTO messages (
+            id, tenant_id, app_id, client_id, channel, origin_kind,
+            from_email, to_email, to_name, to_phone, subject,
+            meta, status, queued_at, sent_at,
+            amount_cents_charged, currency, provider_slug, body_html
+        ) VALUES (
+            CAST(:id AS uuid), CAST(:tid AS uuid), :app, :cli, :ch, :okind,
+            :from_email, :to_email, :to_name, :to_phone, :subject,
+            CAST(:meta AS jsonb), 'sent', :qat, :sat,
+            :amt, 'MXN', :prov, :bhtml
+        )
+    """), {
+        "id": mid, "tid": tenant_id, "app": body.app_id, "cli": body.client_id,
+        "ch": body.channel, "okind": origin_kind,
+        "from_email": body.from_email, "to_email": body.to_email,
+        "to_name": body.to_name, "to_phone": body.to_phone, "subject": body.subject,
+        "meta": json.dumps(meta), "qat": sent_at, "sat": sent_at,
+        "amt": amount, "prov": body.provider_slug, "bhtml": (body.body_html or None),
+    })
+    await db.commit()
+    return {"message_id": mid, "idempotent_replay": False, "channel": body.channel}
