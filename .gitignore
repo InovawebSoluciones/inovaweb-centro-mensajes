@@ -52,3 +52,7 @@ logs/
 # ── SQLite local (si se usa para pruebas) ────────────────────────────────────
 *.sqlite
 *.db
+
+# backups
+*.bak-*
+backups/
