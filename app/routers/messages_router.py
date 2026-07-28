@@ -872,7 +872,7 @@ async def record_message(
     if body.source_ref:
         meta["source_ref"] = body.source_ref
 
-    await db.execute(text("""
+    _ins = (await db.execute(text("""
         INSERT INTO messages (
             id, tenant_id, app_id, client_id, channel, origin_kind,
             from_email, to_email, to_name, to_phone, subject,
@@ -884,6 +884,9 @@ async def record_message(
             CAST(:meta AS jsonb), 'sent', :qat, :sat,
             :amt, 'MXN', :prov, :bhtml
         )
+        ON CONFLICT (tenant_id, (meta->>'source_ref'))
+            WHERE meta ? 'source_ref' DO NOTHING
+        RETURNING id
     """), {
         "id": mid, "tid": tenant_id, "app": body.app_id, "cli": body.client_id,
         "ch": body.channel, "okind": origin_kind,
@@ -891,6 +894,16 @@ async def record_message(
         "to_name": body.to_name, "to_phone": body.to_phone, "subject": body.subject,
         "meta": json.dumps(meta), "qat": sent_at, "sat": sent_at,
         "amt": amount, "prov": body.provider_slug, "bhtml": (body.body_html or None),
-    })
+    })).first()
     await db.commit()
+    if _ins is None:
+        # [FEA 2026-07-27] carrera: mismo source_ref insertado en paralelo entre
+        # el SELECT y el INSERT. El indice unico uq_messages_tenant_sourceref lo
+        # evito; devolvemos la fila existente como replay (no se cobra doble).
+        ex2 = (await db.execute(text(
+            "SELECT id FROM messages WHERE tenant_id = CAST(:t AS uuid) "
+            "AND meta->>'source_ref' = :sr LIMIT 1"
+        ), {"t": tenant_id, "sr": body.source_ref})).first()
+        return {"message_id": str(ex2[0]) if ex2 else mid,
+                "idempotent_replay": True, "channel": body.channel}
     return {"message_id": mid, "idempotent_replay": False, "channel": body.channel}
